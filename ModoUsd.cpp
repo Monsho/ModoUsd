@@ -198,7 +198,7 @@ namespace ModoUsd
 				}
 
 				// マテリアルのエクスポート
-				//WriteMaterial();
+				WriteMaterial();
 			}
 			return LXe_OK;
 		}
