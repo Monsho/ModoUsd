@@ -7,6 +7,8 @@
 #include <lx_action.hpp>
 #include <lx_trisurf.hpp>
 #include <lx_value.hpp>
+#include <lx_deform.hpp>
+#include <lx_mesh.hpp>
 
 #include <lxu_prefvalue.hpp>
 #include <lxu_queries.hpp>
@@ -303,6 +305,42 @@ namespace ModoUsd
 		}
 
 	private:
+		LXtID4 GetSubdType()
+		{
+			class CSubDVisitor : public CLxImpl_AbstractVisitor
+			{
+			public:
+				int				subd_count = 0;
+				int				psub_count = 0;
+				CLxUser_Polygon	poly_;
+
+				LxResult Evaluate()
+				{
+					LXtID4 type;
+					if (poly_.Type(&type) == 0)
+					{
+						if (type == LXiPTYP_SUBD)
+							subd_count++;
+						else if (type == LXiPTYP_PSUB)
+							psub_count++;
+						return LXe_OK;
+					}
+					return LXe_FAILED;
+				}
+			};
+
+			CLxUser_Mesh user_mesh;
+			ChanObject(LXsICHAN_MESH_MESH, user_mesh);
+			CSubDVisitor vis;
+			vis.poly_.fromMeshObj(user_mesh);
+			vis.poly_.Enum(&vis);
+			if (vis.psub_count > 0)
+				return LXiPTYP_PSUB;
+			else if (vis.subd_count > 0)
+				return LXiPTYP_SUBD;
+			return LXiPTYP_FACE;
+		}
+
 		void WriteMesh()
 		{
 			// Pathを作成
@@ -312,6 +350,16 @@ namespace ModoUsd
 			mesh_path = mesh_path.AppendChild(pxr::TfToken(mesh_name.c_str()));
 			auto mesh = pxr::UsdGeomMesh::Define(usd_stage_, mesh_path);
 			usd_curr_mesh_path_ = mesh_path;
+
+			// Subdivisionタイプを取得する
+			auto subd_type = GetSubdType();
+			if (subd_type == LXiPTYP_FACE)
+			{
+				// Subdivisionなしならnoneを設定
+				// Subdivisionありなら何も設定しない→CatmullClarkがデフォルト
+				pxr::TfToken none("none");
+				mesh.CreateSubdivisionSchemeAttr(pxr::VtValue(none), true);
+			}
 
 			// 行列と座標を取得
 			WorldXform(current_mtx_, current_pos_);
@@ -349,6 +397,16 @@ namespace ModoUsd
 				auto st_token = pxr::UsdUtilsGetPrimaryUVSetName();
 				auto st_prim_var = mesh.CreatePrimvar(st_token, pxr::SdfValueTypeNames->Float2Array, pxr::UsdGeomTokens->faceVarying);
 				st_prim_var.Set(usd_uvs_);
+			}
+
+			// このメッシュがアサインされているデフォーマグループを検索する
+			CLxUser_Item mesh_item;
+			GetItem(mesh_item);
+			CLxUser_GroupDeformer group_deformer;
+			unsigned int mesh_index_in_deformer;
+			if (FindGroupDeformer(mesh_item, group_deformer, mesh_index_in_deformer))
+			{
+				// デフォーマーグループが存在するのでスケルトンの出力を行う
 			}
 		}
 
@@ -431,6 +489,99 @@ namespace ModoUsd
 					}
 				}
 			}
+		}
+
+		bool FindGroupDeformer(
+			CLxUser_Item			&meshItem,
+			CLxUser_GroupDeformer	&groupDeformer,
+			unsigned				&groupDeformerMeshIndex)
+		{
+			bool found = false;
+			CLxUser_DeformerService deformerSvc;
+			CLxUser_Item deformer;
+
+			const char* ident1;
+			meshItem.Ident(&ident1);
+
+			CLxUser_Scene scene(SceneObject());
+			unsigned itemCount = scene.NItems(LXiTYPE_ANY);
+			for (unsigned itemIndex = 0; itemIndex < itemCount; ++itemIndex)
+			{
+				CLxUser_Item testItem;
+				CLxUser_Item otherMesh;
+				const char* ident2;
+
+				if (scene.GetItem(LXiTYPE_ANY, itemIndex, testItem))
+				{
+					if (!deformerSvc.IsDeformer(testItem))
+					{
+						continue;
+					}
+
+					unsigned meshCount = 0;
+					if (deformerSvc.MeshCount(testItem, &meshCount) != LXe_TRUE)
+					{
+						continue;
+					}
+
+					for (unsigned meshIndex = 0; meshIndex < meshCount; ++meshIndex)
+					{
+						if (deformerSvc.GetMesh(testItem, meshIndex, otherMesh))
+						{
+							otherMesh.Ident(&ident2);
+							if ((ident1 == ident2) && deformer.set(testItem))
+							{
+								groupDeformerMeshIndex = meshIndex;
+								break;
+							}
+						}
+					}
+
+					if (deformer.test())
+					{
+						break;
+					}
+				}
+			}
+
+			if (deformer.test())
+			{
+				// Get the group deformer object.
+				CLxUser_ChannelRead chans;
+				scene.GetChannels(chans, 0.0);
+
+				if (deformerSvc.GetGroupDeformer(deformer, chans, groupDeformer))
+				{
+					unsigned	count = groupDeformer.DeformerCount();
+					for (unsigned index = 0; index < count; ++index)
+					{
+						CLxLoc_Item	indexedDeformer;
+						if (groupDeformer.GetDeformer(index, indexedDeformer))
+						{
+							const char *deformerName;
+							const char *deformerID;
+							indexedDeformer.Name(&deformerName);
+							indexedDeformer.Ident(&deformerID);
+
+							bool isLocator;
+							CLxLoc_Item locator;
+							if (deformerSvc.GetDeformerDeformationItem(indexedDeformer, locator, isLocator))
+							{
+								const char* locatorName;
+								const char* locatorID;
+								locator.Name(&locatorName);
+								locator.Ident(&locatorID);
+
+								/* Found at least one fully-wired deformer. */
+								found = true;
+								break;
+							}
+						}
+					}
+				}
+			}
+
+			return found;
 		}
 
 	private:
